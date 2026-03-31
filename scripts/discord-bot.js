@@ -21,12 +21,40 @@ const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
 
-const { DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_OWNER_ID } = process.env;
+const { DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_OWNER_ID, DISCORD_ALLOWED_USERS } = process.env;
 
 if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID || !DISCORD_OWNER_ID) {
   console.error('Missing required env vars: DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_OWNER_ID');
   process.exit(1);
 }
+
+// Build the allowed user set: always includes owner, plus any extras from DISCORD_ALLOWED_USERS
+const ALLOWED_USER_IDS = new Set([
+  DISCORD_OWNER_ID,
+  ...(DISCORD_ALLOWED_USERS ? DISCORD_ALLOWED_USERS.split(',').map(id => id.trim()) : []),
+]);
+
+// ─── Single-Instance Lock ─────────────────────────────────────────────────────
+
+const PID_FILE = path.join(__dirname, '../.bot.pid');
+
+// If a PID file exists and that process is still alive, refuse to start
+if (fs.existsSync(PID_FILE)) {
+  const existingPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+  try {
+    process.kill(existingPid, 0); // signal 0 = just check if process exists
+    console.error(`Bot is already running (PID ${existingPid}). Exiting to prevent duplicates.`);
+    process.exit(1);
+  } catch {
+    // Process is dead — stale PID file, safe to continue
+    console.log(`Removing stale PID file (PID ${existingPid} is gone).`);
+  }
+}
+
+fs.writeFileSync(PID_FILE, String(process.pid));
+process.on('exit', () => { try { fs.unlinkSync(PID_FILE); } catch {} });
+process.on('SIGINT', () => process.exit());
+process.on('SIGTERM', () => process.exit());
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -336,9 +364,9 @@ const client = new Client({
 });
 
 client.on('messageCreate', async (message) => {
-  // Security gate: only respond to owner in the designated channel
+  // Security gate: only respond to allowed users in the designated channel
   if (message.author.bot) return;
-  if (message.author.id !== DISCORD_OWNER_ID) return;
+  if (!ALLOWED_USER_IDS.has(message.author.id)) return;
   if (message.channel.id !== DISCORD_CHANNEL_ID) return;
 
   const userId = message.author.id;
