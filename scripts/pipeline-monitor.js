@@ -86,19 +86,20 @@ app.post('/webhook/ghl', (req, res) => {
   // Respond 200 immediately so GHL doesn't retry
   res.status(200).json({ ok: true });
 
-  // Extract fields using bracket notation (GHL sends keys with spaces)
-  const setterName  = req.body['Setter Name'];
-  const contactName = req.body['Name'];
-  const followUpDay = req.body['Follow up day'];
-  const phone       = req.body['Phone'];
+  // GHL nests custom data fields under req.body.customData
+  const data = req.body.customData || {};
+  const setterName  = data['Setter Name'];
+  const contactName = data['Name'];
+  const followUpDay = data['Follow up day'];
+  const phone       = data['Phone'];
 
   if (!setterName) {
-    console.warn('[pipeline-monitor] Webhook payload missing "Setter Name" field — skipping');
+    console.warn('[pipeline-monitor] Webhook payload missing "Setter Name" in customData — skipping');
     return;
   }
 
   if (!contactName || !followUpDay) {
-    console.warn('[pipeline-monitor] Webhook payload missing "Name" or "Follow up day" field — skipping');
+    console.warn('[pipeline-monitor] Webhook payload missing "Name" or "Follow up day" in customData — skipping');
     return;
   }
 
@@ -106,17 +107,13 @@ app.post('/webhook/ghl', (req, res) => {
   const user = USER_MAP[key];
 
   if (!user) {
-    console.warn(`[pipeline-monitor] Unknown setter "${setterName}" (key: "${key}") — not in USER_MAP.`);
+    console.warn(`[pipeline-monitor] Unknown setter "${setterName}" (key: "${key}") — not in USER_MAP`);
     return;
   }
 
-  // Build the Discord message
   let message = `<@${user.userId}> Call ${contactName} for your ${followUpDay} followup.`;
-  if (phone) {
-    message += ` His phone number is ${phone}`;
-  }
+  if (phone) message += ` His phone number is ${phone}`;
 
-  // Send the message to the setter's individual Discord channel
   sendDiscordMessage(user.channelId, message).catch((err) => {
     console.error(`[pipeline-monitor] Failed to send Discord message for setter "${setterName}":`, err.message);
   });
