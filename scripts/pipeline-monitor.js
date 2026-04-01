@@ -15,6 +15,8 @@ require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 
 // ─── Dependencies ─────────────────────────────────────────────────────────────
 
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const { Client, GatewayIntentBits } = require('discord.js');
 
@@ -31,6 +33,26 @@ if (!GHL_WEBHOOK_SECRET) {
   console.error('[pipeline-monitor] Missing required env var: GHL_WEBHOOK_SECRET');
   process.exit(1);
 }
+
+// ─── PID Lock ─────────────────────────────────────────────────────────────────
+
+const PID_FILE = path.join(__dirname, '../.pipeline-monitor.pid');
+
+if (fs.existsSync(PID_FILE)) {
+  const existingPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+  try {
+    process.kill(existingPid, 0);
+    console.error(`[pipeline-monitor] Already running (PID ${existingPid}). Exiting to prevent duplicates.`);
+    process.exit(1);
+  } catch {
+    console.log(`[pipeline-monitor] Removing stale PID file (PID ${existingPid} is gone).`);
+  }
+}
+
+fs.writeFileSync(PID_FILE, String(process.pid));
+process.on('exit', () => { try { fs.unlinkSync(PID_FILE); } catch {} });
+process.on('SIGINT', () => process.exit());
+process.on('SIGTERM', () => process.exit());
 
 // ─── User Map ─────────────────────────────────────────────────────────────────
 
@@ -71,7 +93,12 @@ app.post('/webhook/ghl', (req, res) => {
   const phone       = req.body['Phone'];
 
   if (!setterName) {
-    console.warn('[pipeline-monitor] Webhook received with no "Setter Name" — skipping.');
+    console.warn('[pipeline-monitor] Webhook payload missing "Setter Name" field — skipping');
+    return;
+  }
+
+  if (!contactName || !followUpDay) {
+    console.warn('[pipeline-monitor] Webhook payload missing "Name" or "Follow up day" field — skipping');
     return;
   }
 
@@ -106,6 +133,7 @@ const discordClient = new Client({
  */
 async function sendDiscordMessage(channelId, message) {
   const channel = await discordClient.channels.fetch(channelId);
+  if (!channel) throw new Error(`Channel ${channelId} not found or bot lacks access`);
   await channel.send(message);
 }
 
@@ -118,12 +146,16 @@ discordClient.on('warn', (info) => {
   console.warn('[pipeline-monitor] Discord warning:', info);
 });
 
+// ─── Start Server ─────────────────────────────────────────────────────────────
+
+const PORT = process.env.PIPELINE_PORT || 3001;
+
 // Start Express only after Discord is ready
 discordClient.once('ready', () => {
   console.log(`[pipeline-monitor] Discord bot ready as ${discordClient.user.tag}`);
 
-  app.listen(3001, () => {
-    console.log('[pipeline-monitor] Webhook server listening on port 3001');
+  app.listen(PORT, () => {
+    console.log(`[pipeline-monitor] Webhook server listening on port ${PORT}`);
   });
 });
 
