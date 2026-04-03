@@ -384,6 +384,21 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  // ─── Onboard Command ──────────────────────────────────────────────────────────
+  const onboardMatch = message.content.trim().match(/^onboard\s+(\S+)$/i);
+  if (onboardMatch) {
+    const clientSlug = onboardMatch[1];
+    await message.reply(`Starting Phase 1 for \`${clientSlug}\`...`);
+    try {
+      const { runEmailIntake } = require('./service-delivery/01-email-intake');
+      await runEmailIntake(clientSlug);
+      await message.reply(`Phase 1 complete — \`${clientSlug}\` ready. Run collage and voiceover next.`);
+    } catch (err) {
+      await message.reply(`Phase 1 failed: ${err.message}`);
+    }
+    return;
+  }
+
   // Parse the message as an upload command
   const result = parseUploadCommand(message.content);
 
