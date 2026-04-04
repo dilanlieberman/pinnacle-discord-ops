@@ -388,13 +388,28 @@ client.on('messageCreate', async (message) => {
   const onboardMatch = message.content.trim().match(/^onboard\s+(\S+)$/i);
   if (onboardMatch) {
     const clientSlug = onboardMatch[1];
-    await message.reply(`Starting Phase 1 for \`${clientSlug}\`...`);
     try {
+      // Phase 1: Email Intake
+      await message.reply(`Phase 1 starting for \`${clientSlug}\` — parsing email...`);
       const { runEmailIntake } = require('./service-delivery/01-email-intake');
       await runEmailIntake(clientSlug);
-      await message.reply(`Phase 1 complete — \`${clientSlug}\` ready. Run collage and voiceover next.`);
+      await message.reply(`Phase 1 complete — onboarding.json saved.`);
+
+      // Phase 8: Image Collage
+      await message.reply(`Phase 8 starting — generating collage...`);
+      const { runImageCollage } = require('./service-delivery/08-image-collage');
+      await runImageCollage(clientSlug);
+      await message.reply(`Phase 8 complete — collage.png saved.`);
+
+      // Phase 6: Voiceover + Video Edit
+      await message.reply(`Phase 6 starting — generating voiceover and editing video...`);
+      const { runVoiceoverEdit } = require('./service-delivery/06-voiceover-edit');
+      await runVoiceoverEdit(clientSlug);
+      await message.reply(`Phase 6 complete — final-video.mp4 saved.`);
+
+      await message.reply(`✅ All phases complete for \`${clientSlug}\`. Assets ready in data/clients/${clientSlug}/assets/`);
     } catch (err) {
-      await message.reply(`Phase 1 failed: ${err.message}`);
+      await message.reply(`❌ Pipeline failed: ${err.message}`);
     }
     return;
   }
