@@ -97,6 +97,9 @@ const STATE_NAME_RE = new RegExp(
 // In-memory map of pending shortage decisions: userId → { params, available, expiresAt }
 const pendingShortages = new Map();
 
+// In-memory map of pending onboard asset uploads: userId → { clientSlug, expiresAt }
+const pendingOnboards = new Map();
+
 // ─── Message Parsing ──────────────────────────────────────────────────────────
 
 /**
@@ -353,6 +356,31 @@ async function runUpload(message, params) {
   });
 }
 
+// ─── Onboard Pipeline ────────────────────────────────────────────────────────
+
+async function runOnboardPipeline(message, clientSlug) {
+  try {
+    await message.reply(`Phase 1 starting for \`${clientSlug}\` — parsing email...`);
+    const { runEmailIntake } = require('./service-delivery/01-email-intake');
+    await runEmailIntake(clientSlug);
+    await message.reply(`Phase 1 complete — onboarding.json saved.`);
+
+    await message.reply(`Phase 8 starting — generating collage...`);
+    const { runImageCollage } = require('./service-delivery/08-image-collage');
+    await runImageCollage(clientSlug);
+    await message.reply(`Phase 8 complete — collage.png saved.`);
+
+    await message.reply(`Phase 6 starting — generating voiceover and editing video...`);
+    const { runVoiceoverEdit } = require('./service-delivery/06-voiceover-edit');
+    await runVoiceoverEdit(clientSlug);
+    await message.reply(`Phase 6 complete — final-video.mp4 saved.`);
+
+    await message.reply(`✅ All phases complete for \`${clientSlug}\`. Assets ready in data/clients/${clientSlug}/assets/`);
+  } catch (err) {
+    await message.reply(`❌ Pipeline failed: ${err.message}`);
+  }
+}
+
 // ─── Event Handlers & Startup ─────────────────────────────────────────────────
 
 const client = new Client({
@@ -384,33 +412,98 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // ─── Onboard Command ──────────────────────────────────────────────────────────
-  const onboardMatch = message.content.trim().match(/^onboard\s+(\S+)$/i);
-  if (onboardMatch) {
-    const clientSlug = onboardMatch[1];
-    try {
-      // Phase 1: Email Intake
-      await message.reply(`Phase 1 starting for \`${clientSlug}\` — parsing email...`);
-      const { runEmailIntake } = require('./service-delivery/01-email-intake');
-      await runEmailIntake(clientSlug);
-      await message.reply(`Phase 1 complete — onboarding.json saved.`);
-
-      // Phase 8: Image Collage
-      await message.reply(`Phase 8 starting — generating collage...`);
-      const { runImageCollage } = require('./service-delivery/08-image-collage');
-      await runImageCollage(clientSlug);
-      await message.reply(`Phase 8 complete — collage.png saved.`);
-
-      // Phase 6: Voiceover + Video Edit
-      await message.reply(`Phase 6 starting — generating voiceover and editing video...`);
-      const { runVoiceoverEdit } = require('./service-delivery/06-voiceover-edit');
-      await runVoiceoverEdit(clientSlug);
-      await message.reply(`Phase 6 complete — final-video.mp4 saved.`);
-
-      await message.reply(`✅ All phases complete for \`${clientSlug}\`. Assets ready in data/clients/${clientSlug}/assets/`);
-    } catch (err) {
-      await message.reply(`❌ Pipeline failed: ${err.message}`);
+  // ─── Onboard: Sync assets on "update" ──────────────────────────────────────
+  if (pendingOnboards.has(userId) && /^update$/i.test(message.content.trim())) {
+    const pending = pendingOnboards.get(userId);
+    if (Date.now() > pending.expiresAt) {
+      pendingOnboards.delete(userId);
+      await message.reply('Onboard session expired. Run `onboard <name>` again.');
+      return;
     }
+
+    const slug = pending.clientSlug;
+    const reqDir = '/root/smma-agency/.sync-requests';
+    fs.mkdirSync(reqDir, { recursive: true });
+
+    // Clear any stale flag files from previous runs
+    for (const ext of ['.pending', '.done', '.error']) {
+      try { fs.unlinkSync(path.join(reqDir, slug + ext)); } catch {}
+    }
+
+    // Write pending flag for the local watcher to pick up
+    fs.writeFileSync(path.join(reqDir, slug + '.pending'), '');
+    await message.reply(`🔄 Syncing \`${slug}\` assets from your Mac...`);
+
+    // Poll for done/error flag (max 30s)
+    const start = Date.now();
+    const donePath = path.join(reqDir, slug + '.done');
+    const errorPath = path.join(reqDir, slug + '.error');
+
+    const pollInterval = setInterval(async () => {
+      try {
+        if (fs.existsSync(donePath)) {
+          clearInterval(pollInterval);
+          fs.unlinkSync(donePath);
+          await message.reply(`✅ \`${slug}\` assets synced to VPS. Type \`continue\` to run the pipeline.`);
+          return;
+        }
+        if (fs.existsSync(errorPath)) {
+          clearInterval(pollInterval);
+          const err = fs.readFileSync(errorPath, 'utf8').trim();
+          fs.unlinkSync(errorPath);
+          await message.reply(`❌ Sync failed: ${err}`);
+          return;
+        }
+        if (Date.now() - start > 30000) {
+          clearInterval(pollInterval);
+          // Clean up the pending flag since nobody is listening
+          try { fs.unlinkSync(path.join(reqDir, slug + '.pending')); } catch {}
+          await message.reply('❌ Sync timed out after 30s. Make sure `sync-watcher.sh` is running on your Mac.');
+        }
+      } catch (e) {
+        clearInterval(pollInterval);
+        await message.reply(`❌ Sync error: ${e.message}`);
+      }
+    }, 1000);
+    return;
+  }
+
+  // ─── Onboard: Resume on "continue" ─────────────────────────────────────────
+  if (pendingOnboards.has(userId) && /^continue$/i.test(message.content.trim())) {
+    const pending = pendingOnboards.get(userId);
+    if (Date.now() > pending.expiresAt) {
+      pendingOnboards.delete(userId);
+      await message.reply('Onboard session expired. Run `onboard <name>` again.');
+      return;
+    }
+    pendingOnboards.delete(userId);
+    await runOnboardPipeline(message, pending.clientSlug);
+    return;
+  }
+
+  // ─── Onboard Command ──────────────────────────────────────────────────────────
+  const onboardMatch = message.content.trim().match(/^onboard\s+(.+)$/i);
+  if (onboardMatch) {
+    // Convert name to slug: "New View Renovations" → "new-view-renovations"
+    const clientSlug = onboardMatch[1].trim().toLowerCase().replace(/\s+/g, '-');
+    const assetsDir = path.join(__dirname, `../data/clients/${clientSlug}/assets`);
+    fs.mkdirSync(assetsDir, { recursive: true });
+
+    // Check for required assets
+    const hasSelfie = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(assetsDir, `selfie.${ext}`)));
+    const hasLogo = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(assetsDir, `logo.${ext}`)));
+
+    if (!hasSelfie || !hasLogo) {
+      const missing = [!hasSelfie && 'selfie', !hasLogo && 'logo'].filter(Boolean);
+      pendingOnboards.set(userId, { clientSlug, expiresAt: Date.now() + 30 * 60 * 1000 });
+      await message.reply(
+        `Folder created: \`data/clients/${clientSlug}/assets/\`\n\n` +
+        `Missing: **${missing.join(', ')}** — upload ${missing.map(m => `\`${m}.png\``).join(' and ')} to that folder, then type \`continue\`.`
+      );
+      return;
+    }
+
+    await runOnboardPipeline(message, clientSlug);
     return;
   }
 
