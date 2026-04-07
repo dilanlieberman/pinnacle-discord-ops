@@ -8,7 +8,10 @@
  *   node scripts/discord-bot.js
  *
  * Required .env vars:
- *   DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_OWNER_ID
+ *   DISCORD_BOT_TOKEN, DISCORD_OWNER_ID
+ *   DISCORD_LEADS_CHANNEL_ID    — channel that accepts upload commands
+ *   DISCORD_ONBOARD_CHANNEL_ID  — channel that accepts `onboard <name>`
+ *   (legacy DISCORD_CHANNEL_ID is still honored as a fallback for both)
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
@@ -21,10 +24,21 @@ const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
 
-const { DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_OWNER_ID, DISCORD_ALLOWED_USERS } = process.env;
+const {
+  DISCORD_BOT_TOKEN,
+  DISCORD_CHANNEL_ID,            // legacy single-channel var
+  DISCORD_LEADS_CHANNEL_ID,
+  DISCORD_ONBOARD_CHANNEL_ID,
+  DISCORD_OWNER_ID,
+  DISCORD_ALLOWED_USERS,
+} = process.env;
 
-if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID || !DISCORD_OWNER_ID) {
-  console.error('Missing required env vars: DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_OWNER_ID');
+// Back-compat: fall back to legacy DISCORD_CHANNEL_ID for either role if specific one isn't set
+const LEADS_CHANNEL_ID   = DISCORD_LEADS_CHANNEL_ID   || DISCORD_CHANNEL_ID;
+const ONBOARD_CHANNEL_ID = DISCORD_ONBOARD_CHANNEL_ID || DISCORD_CHANNEL_ID;
+
+if (!DISCORD_BOT_TOKEN || !DISCORD_OWNER_ID || (!LEADS_CHANNEL_ID && !ONBOARD_CHANNEL_ID)) {
+  console.error('Missing required env vars: DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and at least one of DISCORD_LEADS_CHANNEL_ID / DISCORD_ONBOARD_CHANNEL_ID');
   process.exit(1);
 }
 
@@ -99,6 +113,23 @@ const pendingShortages = new Map();
 
 // In-memory map of pending onboard asset uploads: userId → { clientSlug, expiresAt }
 const pendingOnboards = new Map();
+
+// Global upload mutex — only one upload can run at a time per bot instance.
+// Prevents two simultaneous commands from racing on the same (or overlapping)
+// row ranges, which is what caused the 504/496 duplicate split earlier today.
+// Shape: { userId, params, startedAt } or null.
+let currentUpload = null;
+
+// Per-user recent-command cache for debouncing identical back-to-back uploads.
+// Blocks the exact same command (same service+state+count+account+workflow)
+// from the same user within DEBOUNCE_MS — defends against accidental double-taps
+// and Discord retries.
+const recentCommands = new Map(); // userId → { hash, timestamp }
+const DEBOUNCE_MS = 60_000;
+
+function commandHash(params) {
+  return `${params.service}|${params.state}|${params.count}|${params.account.toLowerCase()}|${params.workflow.toLowerCase()}`;
+}
 
 // ─── Message Parsing ──────────────────────────────────────────────────────────
 
@@ -285,23 +316,48 @@ function formatDuration(seconds) {
 }
 
 /**
- * Read the most recently modified upload log from data/logs/.
+ * Read the most recently modified upload log from data/logs/, but only if it
+ * was written AFTER `sinceMs`. This prevents reporting a stale log from a
+ * previous upload when the current child exited before writing one (e.g. it
+ * silently bailed on an interactive prompt under stdin=/dev/null).
+ *
+ * Returns the log object, or null if no fresh log exists.
  */
-function readMostRecentLog() {
+function readFreshLog(sinceMs) {
   const files = fs.readdirSync(LOGS_DIR)
     .filter(f => f.startsWith('upload-') && f.endsWith('.json'))
     .map(f => ({ name: f, mtime: fs.statSync(path.join(LOGS_DIR, f)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime);
 
-  if (files.length === 0) throw new Error('No log files found in data/logs/');
+  if (files.length === 0) return null;
+  if (files[0].mtime < sinceMs) return null;
 
   return JSON.parse(fs.readFileSync(path.join(LOGS_DIR, files[0].name), 'utf8'));
 }
 
 /**
  * Spawn ghl-lead-uploader.js as a child process and report results to Discord.
+ *
+ * Guarded by the global `currentUpload` mutex to ensure only ONE uploader child
+ * runs per bot instance at a time. The caller in messageCreate is responsible
+ * for refusing new work while `currentUpload` is non-null; this function still
+ * sets/clears it defensively so callers can't forget.
  */
 async function runUpload(message, params) {
+  // Defensive: if somehow another upload is already running, refuse rather
+  // than racing. The messageCreate handler should have caught this, but
+  // handleShortageReply also routes here and we want one choke point.
+  if (currentUpload) {
+    await message.reply(
+      `Refusing to start: another upload is already in progress. This shouldn't happen — please report it.`
+    );
+    return;
+  }
+
+  currentUpload = { userId: message.author.id, params, startedAt: Date.now() };
+  // Record for debouncing — any identical command within DEBOUNCE_MS will be ignored
+  recentCommands.set(message.author.id, { hash: commandHash(params), timestamp: Date.now() });
+
   await message.reply(
     `Starting upload: ${params.count} ${params.state} ${params.service} leads → ${params.account} → workflow: ${params.workflow}`
   );
@@ -314,6 +370,11 @@ async function runUpload(message, params) {
     '--account',  params.account,
     '--workflow', params.workflow,
   ];
+
+  // Capture spawn time so we can reject any stale log file from a previous run.
+  // Subtract 1s to absorb clock skew between this process and the child's
+  // log-write fs call.
+  const spawnTime = Date.now() - 1000;
 
   const child = spawn('node', args, {
     cwd: path.join(__dirname, '..'),  // project root — required for relative paths in the uploader
@@ -328,30 +389,69 @@ async function runUpload(message, params) {
   child.stdout.on('data', (chunk) => { process.stdout.write(chunk); });
 
   await new Promise((resolve) => {
+    // Helper so every exit path releases the mutex, no matter what
+    const release = () => { currentUpload = null; resolve(); };
+
     child.on('error', async (err) => {
       await message.reply(`Failed to start upload process: ${err.message}`).catch(console.error);
-      resolve();
+      release();
     });
 
     child.on('close', async (code) => {
       if (code !== 0) {
         const errMsg = stderrBuffer.trim().slice(0, 1800) || `Process exited with code ${code}`;
         await message.reply(`Upload failed (exit code ${code}):\n\`\`\`\n${errMsg}\n\`\`\``).catch(console.error);
-        resolve();
+        release();
         return;
       }
 
+      // Exit code 0 — but we still need to verify a NEW log file was actually
+      // written. If the script exited cleanly without writing a log, it almost
+      // certainly hit an interactive prompt (stdin=/dev/null hangs readline,
+      // then Node exits 0 with no pending work). In that case, surface stderr
+      // so the user can see what went wrong instead of reading a stale log.
       try {
-        const logData = readMostRecentLog();
+        const logData = readFreshLog(spawnTime);
+        if (!logData) {
+          const errMsg = stderrBuffer.trim().slice(0, 1800) ||
+            '(no stderr captured — script likely hit an interactive prompt)';
+          await message.reply(
+            `Upload finished with exit code 0 but produced **no log file** — the ` +
+            `script likely hit an interactive prompt or exited early. No leads ` +
+            `were uploaded. Stderr:\n\`\`\`\n${errMsg}\n\`\`\``
+          ).catch(console.error);
+          release();
+          return;
+        }
         const s = logData.summary;
-        await message.reply(
-          `Done! Uploaded: ${s.uploaded} | Skipped: ${s.skipped} | Failed: ${s.failed} | Time: ${formatDuration(s.durationSeconds)}`
-        );
+        // New summary fields (requested/processed/cursorAdvanced/invariantOk)
+        // are present on logs from the patched script. Fall back gracefully
+        // for any older log just in case.
+        const requested = s.requested ?? s.processed ?? (s.uploaded + s.skipped + s.failed);
+        const processed = s.processed ?? (s.uploaded + s.skipped + s.failed);
+        const advanced  = s.cursorAdvanced ?? processed;
+        const invariantOk = s.invariantOk !== false;
+
+        let reply =
+          `**Done!** Requested: ${requested} | Processed: ${processed} | ` +
+          `New: ${s.uploaded} | Already in GHL: ${s.skipped} | Failed: ${s.failed} | ` +
+          `Time: ${formatDuration(s.durationSeconds)}`;
+
+        if (!invariantOk || advanced !== processed || processed !== requested) {
+          reply += `\n⚠️ **Invariant warning:** cursor advanced by ${advanced} but ` +
+            `${processed} rows were processed against a request of ${requested}. ` +
+            `Tracking may be off — DO NOT run another upload from this state until verified.`;
+        }
+        if (s.failed > 0) {
+          reply += `\n⚠️ ${s.failed} row(s) failed permanently — see the log file for recovery: \`data/logs/\``;
+        }
+
+        await message.reply(reply);
       } catch (logErr) {
         await message.reply(`Upload completed but couldn't read log file: ${logErr.message}`).catch(console.error);
       }
 
-      resolve();
+      release();
     });
   });
 }
@@ -392,12 +492,27 @@ const client = new Client({
 });
 
 client.on('messageCreate', async (message) => {
-  // Security gate: only respond to allowed users in the designated channel
+  // Security gate: only respond to allowed users in the designated channels
   if (message.author.bot) return;
   if (!ALLOWED_USER_IDS.has(message.author.id)) return;
-  if (message.channel.id !== DISCORD_CHANNEL_ID) return;
+
+  const channelId = message.channel.id;
+  const isLeadsChannel   = channelId === LEADS_CHANNEL_ID;
+  const isOnboardChannel = channelId === ONBOARD_CHANNEL_ID;
+  if (!isLeadsChannel && !isOnboardChannel) return;
 
   const userId = message.author.id;
+
+  // ─── Onboard channel: only handle onboard commands ──────────────────────────
+  // (If LEADS_CHANNEL_ID === ONBOARD_CHANNEL_ID via legacy fallback, we fall
+  // through to the leads section after onboard commands don't match.)
+  if (isOnboardChannel) {
+    const handled = await handleOnboardChannel(message, userId);
+    if (handled) return;
+    if (!isLeadsChannel) return; // pure onboard channel — ignore non-onboard chatter
+  }
+
+  // ─── Leads channel: shortage replies + upload commands ──────────────────────
 
   // Check if we're waiting on a shortage reply from this user
   if (pendingShortages.has(userId)) {
@@ -412,13 +527,95 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  // Parse the message as an upload command
+  const result = parseUploadCommand(message.content);
+
+  if (!result.success) {
+    await message.reply(
+      `Couldn't parse your command. Missing: **${result.missing.join(', ')}**.\n\n` +
+      'Format: `Upload <count> <state> <service> into <account> and trigger <workflow>`\n' +
+      `Valid services: ${VALID_SERVICES.join(', ')}`
+    );
+    return;
+  }
+
+  const { params } = result;
+
+  // Validate service and CSV existence
+  const validation = validateParams(params);
+  if (!validation.valid) {
+    await message.reply(`Validation error: ${validation.error}`);
+    return;
+  }
+
+  // Debounce: reject an identical command from the same user within DEBOUNCE_MS.
+  // Guards against accidental double-tap / ENTER mashing / Discord retries.
+  const hash = commandHash(params);
+  const recent = recentCommands.get(userId);
+  if (recent && recent.hash === hash && Date.now() - recent.timestamp < DEBOUNCE_MS) {
+    const ago = Math.round((Date.now() - recent.timestamp) / 1000);
+    await message.reply(
+      `Ignoring duplicate command — the identical upload was requested ${ago}s ago. ` +
+      `Wait at least ${Math.ceil(DEBOUNCE_MS / 1000)}s between identical commands.`
+    );
+    return;
+  }
+
+  // Global mutex: refuse to start a new upload while one is already running.
+  // Prevents two concurrent uploads from racing on overlapping CSV rows.
+  if (currentUpload) {
+    const elapsed = Math.round((Date.now() - currentUpload.startedAt) / 1000);
+    const p = currentUpload.params;
+    await message.reply(
+      `An upload is already in progress (running ${elapsed}s: ${p.count} ${p.state} ${p.service} → ${p.account}). ` +
+      `Wait for it to finish before starting another.`
+    );
+    return;
+  }
+
+  // Check for lead shortage BEFORE spawning (uploader would prompt stdin otherwise)
+  let shortageInfo;
+  try {
+    shortageInfo = checkShortage(params);
+  } catch (err) {
+    await message.reply(`Error checking lead availability: ${err.message}`);
+    return;
+  }
+
+  if (shortageInfo.shortage) {
+    const { available } = shortageInfo;
+    pendingShortages.set(userId, {
+      params,
+      available,
+      expiresAt: Date.now() + SHORTAGE_TTL_MS,
+    });
+
+    await message.reply(
+      `Only **${available}** unused ${params.state} ${params.service} leads remaining. You asked for ${params.count}.\n\n` +
+      `Options:\n` +
+      `• \`1\` — upload only the ${available} available\n` +
+      `• \`2 GA\` — upload ${available} from ${params.state} and fill the remaining ${params.count - available} from another state (replace GA with your choice)\n\n` +
+      `Reply with your choice (expires in 5 minutes).`
+    );
+    return;
+  }
+
+  // All clear — run the upload
+  await runUpload(message, params).catch(console.error);
+});
+
+/**
+ * Handle messages in the onboard channel. Returns true if the message was
+ * recognized as an onboard command (or pending-onboard reply), false otherwise.
+ */
+async function handleOnboardChannel(message, userId) {
   // ─── Onboard: Sync assets on "update" ──────────────────────────────────────
   if (pendingOnboards.has(userId) && /^update$/i.test(message.content.trim())) {
     const pending = pendingOnboards.get(userId);
     if (Date.now() > pending.expiresAt) {
       pendingOnboards.delete(userId);
       await message.reply('Onboard session expired. Run `onboard <name>` again.');
-      return;
+      return true;
     }
 
     const slug = pending.clientSlug;
@@ -465,7 +662,7 @@ client.on('messageCreate', async (message) => {
         await message.reply(`❌ Sync error: ${e.message}`);
       }
     }, 1000);
-    return;
+    return true;
   }
 
   // ─── Onboard: Resume on "continue" ─────────────────────────────────────────
@@ -474,11 +671,11 @@ client.on('messageCreate', async (message) => {
     if (Date.now() > pending.expiresAt) {
       pendingOnboards.delete(userId);
       await message.reply('Onboard session expired. Run `onboard <name>` again.');
-      return;
+      return true;
     }
     pendingOnboards.delete(userId);
     await runOnboardPipeline(message, pending.clientSlug);
-    return;
+    return true;
   }
 
   // ─── Onboard Command ──────────────────────────────────────────────────────────
@@ -500,73 +697,28 @@ client.on('messageCreate', async (message) => {
         `Folder created: \`data/clients/${clientSlug}/assets/\`\n\n` +
         `Missing: **${missing.join(', ')}** — upload ${missing.map(m => `\`${m}.png\``).join(' and ')} to that folder, then type \`continue\`.`
       );
-      return;
+      return true;
     }
 
     await runOnboardPipeline(message, clientSlug);
-    return;
+    return true;
   }
 
-  // Parse the message as an upload command
-  const result = parseUploadCommand(message.content);
-
-  if (!result.success) {
-    await message.reply(
-      `Couldn't parse your command. Missing: **${result.missing.join(', ')}**.\n\n` +
-      'Format: `Upload <count> <state> <service> into <account> and trigger <workflow>`\n' +
-      `Valid services: ${VALID_SERVICES.join(', ')}`
-    );
-    return;
-  }
-
-  const { params } = result;
-
-  // Validate service and CSV existence
-  const validation = validateParams(params);
-  if (!validation.valid) {
-    await message.reply(`Validation error: ${validation.error}`);
-    return;
-  }
-
-  // Check for lead shortage BEFORE spawning (uploader would prompt stdin otherwise)
-  let shortageInfo;
-  try {
-    shortageInfo = checkShortage(params);
-  } catch (err) {
-    await message.reply(`Error checking lead availability: ${err.message}`);
-    return;
-  }
-
-  if (shortageInfo.shortage) {
-    const { available } = shortageInfo;
-    pendingShortages.set(userId, {
-      params,
-      available,
-      expiresAt: Date.now() + SHORTAGE_TTL_MS,
-    });
-
-    await message.reply(
-      `Only **${available}** unused ${params.state} ${params.service} leads remaining. You asked for ${params.count}.\n\n` +
-      `Options:\n` +
-      `• \`1\` — upload only the ${available} available\n` +
-      `• \`2 GA\` — upload ${available} from ${params.state} and fill the remaining ${params.count - available} from another state (replace GA with your choice)\n\n` +
-      `Reply with your choice (expires in 5 minutes).`
-    );
-    return;
-  }
-
-  // All clear — run the upload
-  await runUpload(message, params).catch(console.error);
-});
+  return false;
+}
 
 client.once('clientReady', async () => {
   console.log(`Bot online — logged in as ${client.user.tag}`);
 
-  try {
-    const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
-    await channel.send('Lead Uploader Bot is online.');
-  } catch (err) {
-    console.error('Could not send startup message to channel:', err.message);
+  // Post startup ping to each configured channel (deduped if both env vars point to the same one)
+  const startupChannels = [...new Set([LEADS_CHANNEL_ID, ONBOARD_CHANNEL_ID].filter(Boolean))];
+  for (const id of startupChannels) {
+    try {
+      const channel = await client.channels.fetch(id);
+      await channel.send('Lead Uploader Bot is online.');
+    } catch (err) {
+      console.error(`Could not send startup message to channel ${id}:`, err.message);
+    }
   }
 });
 
