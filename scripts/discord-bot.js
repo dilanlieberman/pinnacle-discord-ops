@@ -114,6 +114,9 @@ const pendingShortages = new Map();
 // In-memory map of pending onboard asset uploads: userId → { clientSlug, expiresAt }
 const pendingOnboards = new Map();
 
+// In-memory map of pending 'continue' resolvers for the orchestrator pause points
+const pendingContinues = new Map();
+
 // Global upload mutex — only one upload can run at a time per bot instance.
 // Prevents two simultaneous commands from racing on the same (or overlapping)
 // row ranges, which is what caused the 504/496 duplicate split earlier today.
@@ -273,28 +276,83 @@ async function handleShortageReply(message, pendingState) {
     return;
   }
 
-  // Match "2 GA" or "2 Georgia" etc.
-  const option2Match = text.match(/^2\s+([A-Za-z]{2,}(?:\s+[A-Za-z]+)*)$/);
-  if (option2Match) {
-    pendingShortages.delete(message.author.id);
-    const stateInput = option2Match[1].trim();
-    // Normalize to abbreviation
-    const fillState = STATE_ABBREVS[stateInput.toLowerCase()] ?? stateInput.toUpperCase();
+  // Match option 2 loosely — accepts anything that starts with "2" followed
+  // by a state hint, in any form the user might type:
+  //   "2 GA"
+  //   "2 Nevada"
+  //   "2 NV — upload 628 from UT and fill the remaining 372 from another state"
+  //   "2 New York fill the rest"
+  //   "2nv"
+  // Strategy: require a leading "2", then reuse the main command parser's
+  // state-name regex + 2-letter-abbrev fallback on the remainder.
+  const option2Lead = text.match(/^\s*2[\s,:.\-]*(.*)$/);
+  if (option2Lead) {
+    const after = option2Lead[1];
+    let fillState = null;
 
-    if (!VALID_STATE_ABBREVS.has(fillState)) {
-      await message.reply(`Unknown state "${stateInput}". Use a 2-letter abbreviation like GA, TX, FL.`);
+    // 1) Full state name ("Nevada", "New York") — longest-first regex
+    const nameMatch = after.match(STATE_NAME_RE);
+    if (nameMatch) {
+      fillState = STATE_ABBREVS[nameMatch[1].toLowerCase()];
+    }
+    // 2) Fall back to first uppercase 2-letter token ("NV", "GA")
+    if (!fillState) {
+      const abbrevMatch = after.match(/\b([A-Za-z]{2})\b/);
+      if (abbrevMatch && VALID_STATE_ABBREVS.has(abbrevMatch[1].toUpperCase())) {
+        fillState = abbrevMatch[1].toUpperCase();
+      }
+    }
+
+    if (!fillState) {
+      await message.reply(
+        `Could not find a state in your reply. Try \`2 NV\` or \`2 Nevada\` — just the number \`2\` and the state.`
+      );
       return;
     }
 
+    pendingShortages.delete(message.author.id);
+
     const needed = params.count - available;
-    const cmd1 = buildCommandString({ ...params, count: available });
-    const cmd2 = buildCommandString({ ...params, state: fillState, count: needed });
+    const primaryParams   = { ...params, count: available };
+    const secondaryParams = { ...params, state: fillState, count: needed };
+
+    // Validate the secondary state has a CSV and enough unused leads BEFORE
+    // starting anything — better to fail fast than to run the primary upload
+    // and then discover we can't complete the fill.
+    const secondaryValidation = validateParams(secondaryParams);
+    if (!secondaryValidation.valid) {
+      await message.reply(`Can't fill from ${fillState}: ${secondaryValidation.error}`);
+      return;
+    }
+    let secondaryCheck;
+    try {
+      secondaryCheck = checkShortage(secondaryParams);
+    } catch (err) {
+      await message.reply(`Error checking ${fillState} availability: ${err.message}`);
+      return;
+    }
+    if (secondaryCheck.shortage) {
+      await message.reply(
+        `Can't fill from ${fillState}: only **${secondaryCheck.available}** unused ` +
+        `${fillState} ${params.service} leads available, need **${needed}**. ` +
+        `Try a different state.`
+      );
+      return;
+    }
 
     await message.reply(
-      `To fill from ${fillState}, run these two uploads separately:\n` +
-      `**1.** \`${cmd1}\`\n` +
-      `**2.** \`${cmd2}\``
+      `Running 2 uploads back-to-back:\n` +
+      `**1.** ${available} ${params.state} → ${params.account} (${params.workflow})\n` +
+      `**2.** ${needed} ${fillState} → ${params.account} (${params.workflow})`
     );
+
+    // Run sequentially. runUpload sets/clears the global currentUpload mutex
+    // internally, so by the time the first await returns the mutex is free
+    // and the second call can acquire it cleanly. The two commands have
+    // different state values, so the per-user debounce also doesn't block
+    // the second one.
+    await runUpload(message, primaryParams).catch(console.error);
+    await runUpload(message, secondaryParams).catch(console.error);
     return;
   }
 
@@ -459,25 +517,23 @@ async function runUpload(message, params) {
 // ─── Onboard Pipeline ────────────────────────────────────────────────────────
 
 async function runOnboardPipeline(message, clientSlug) {
+  const { runFullPipeline } = require('./service-delivery/orchestrator');
+
+  const userId = message.author.id;
+
+  const waitForContinue = () => new Promise(resolve => {
+    pendingContinues.set(userId, resolve);
+  });
+
   try {
-    await message.reply(`Phase 1 starting for \`${clientSlug}\` — parsing email...`);
-    const { runEmailIntake } = require('./service-delivery/01-email-intake');
-    await runEmailIntake(clientSlug);
-    await message.reply(`Phase 1 complete — onboarding.json saved.`);
-
-    await message.reply(`Phase 8 starting — generating collage...`);
-    const { runImageCollage } = require('./service-delivery/08-image-collage');
-    await runImageCollage(clientSlug);
-    await message.reply(`Phase 8 complete — collage.png saved.`);
-
-    await message.reply(`Phase 6 starting — generating voiceover and editing video...`);
-    const { runVoiceoverEdit } = require('./service-delivery/06-voiceover-edit');
-    await runVoiceoverEdit(clientSlug);
-    await message.reply(`Phase 6 complete — final-video.mp4 saved.`);
-
-    await message.reply(`✅ All phases complete for \`${clientSlug}\`. Assets ready in data/clients/${clientSlug}/assets/`);
+    await runFullPipeline(clientSlug, {
+      notify: msg => message.channel.send(msg),
+      waitForContinue,
+    });
   } catch (err) {
-    await message.reply(`❌ Pipeline failed: ${err.message}`);
+    await message.channel.send(`❌ Pipeline failed at: ${err.message}`);
+  } finally {
+    pendingContinues.delete(userId);
   }
 }
 
@@ -662,6 +718,14 @@ async function handleOnboardChannel(message, userId) {
         await message.reply(`❌ Sync error: ${e.message}`);
       }
     }, 1000);
+    return true;
+  }
+
+  // ─── Orchestrator: Resume on "continue" ──────────────────────────────────
+  if (pendingContinues.has(userId) && /^continue$/i.test(message.content.trim())) {
+    const resolve = pendingContinues.get(userId);
+    pendingContinues.delete(userId);
+    resolve();
     return true;
   }
 
