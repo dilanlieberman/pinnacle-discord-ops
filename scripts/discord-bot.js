@@ -505,6 +505,17 @@ async function runUpload(message, params) {
         }
 
         await message.reply(reply);
+
+        // Sync lead inventory to Supabase after successful upload
+        try {
+          const { execFile } = require('child_process');
+          execFile('node', [require('path').join(__dirname, 'agency-tracker/lead-inventory-sync.js')], { timeout: 30000 }, (err, stdout) => {
+            if (err) console.error('[lead-inventory] post-upload sync failed:', err.message);
+            else console.log('[lead-inventory] post-upload sync done');
+          });
+        } catch (syncErr) {
+          console.error('[lead-inventory] sync trigger failed:', syncErr.message);
+        }
       } catch (logErr) {
         await message.reply(`Upload completed but couldn't read log file: ${logErr.message}`).catch(console.error);
       }
