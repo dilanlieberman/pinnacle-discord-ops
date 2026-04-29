@@ -812,24 +812,43 @@ async function handleOnboardChannel(message, userId) {
     fs.writeFileSync(path.join(targetDir, 'onboarding.json'), JSON.stringify(onb, null, 2));
     fs.copyFileSync(sourceMetaConfig, path.join(targetDir, 'meta-config.json'));
 
-    const hasSelfie = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(targetAssets, `selfie.${ext}`)));
-    const hasLogo = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(targetAssets, `logo.${ext}`)));
+    // Pull selfies + logo from the source client's assets folder. The
+    // pipeline reads inputs from `data/clients/<slug>/assets/`, so we copy
+    // (rather than symlink) the source inputs in. Pipeline outputs still
+    // land here in dry-test/assets/, leaving the source folder untouched.
+    const sourceAssetsDir = path.join(clientsDir, sourceSlug, 'assets');
+    const exts = ['jpg', 'jpeg', 'png', 'webp'];
+    const inputBases = ['selfie', 'selfie-1', 'selfie-2', 'logo'];
+    const copied = [];
+    for (const base of inputBases) {
+      for (const ext of exts) {
+        const src = path.join(sourceAssetsDir, `${base}.${ext}`);
+        if (fs.existsSync(src)) {
+          fs.copyFileSync(src, path.join(targetAssets, `${base}.${ext}`));
+          copied.push(`${base}.${ext}`);
+          break; // first matching extension wins
+        }
+      }
+    }
+
+    const hasSelfie = ['selfie', 'selfie-1', 'selfie-2'].some(b => copied.some(f => f.startsWith(`${b}.`)));
+    const hasLogo = copied.some(f => f.startsWith('logo.'));
+    if (!hasSelfie || !hasLogo) {
+      const missing = [!hasSelfie && 'selfie', !hasLogo && 'logo'].filter(Boolean);
+      await message.reply(`Source \`${sourceSlug}\` is missing **${missing.join(', ')}** in its assets folder — can't clone for dry test.`);
+      return true;
+    }
 
     pendingOnboards.set(userId, { clientSlug: DRY_TEST_SLUG, expiresAt: Date.now() + 30 * 60 * 1000 });
 
-    let reply =
+    await message.reply(
       `🧪 Dry test cloned from \`${sourceSlug}\`\n` +
-      `Folder: \`data/clients/${DRY_TEST_SLUG}/assets/\`\n` +
+      `Folder: \`data/clients/${DRY_TEST_SLUG}/\` (outputs land here, source is untouched)\n` +
+      `Inputs pulled from \`${sourceSlug}/assets/\`: ${copied.join(', ')}\n` +
       `Sub-account: \`${DRY_TEST_LOCATION_ID}\` (Phase 2 will create the PIT during the run)\n` +
-      `Meta: same ad account / pixel as \`${sourceSlug}\` — campaigns will be added alongside the existing ones\n` +
-      `All 11 phases run normally against the cloned data.\n\n`;
-    if (!hasSelfie || !hasLogo) {
-      const missing = [!hasSelfie && 'selfie', !hasLogo && 'logo'].filter(Boolean);
-      reply += `Missing: **${missing.join(', ')}** — upload ${missing.map(m => `\`${m}.png\``).join(' and ')} to that folder, then type \`continue\`.`;
-    } else {
-      reply += `Selfie + logo already present. Type \`continue\` to run the pipeline.`;
-    }
-    await message.reply(reply);
+      `Meta: same ad account / pixel as \`${sourceSlug}\` — campaigns added alongside existing ones\n\n` +
+      `Type \`continue\` to run all 11 phases.`
+    );
     return true;
   }
 
