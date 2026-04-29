@@ -23,15 +23,21 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
+const { startWhopWatcher, paymentAmount } = require('./lib/whop-watcher');
 
 const {
   DISCORD_BOT_TOKEN,
   DISCORD_CHANNEL_ID,            // legacy single-channel var
   DISCORD_LEADS_CHANNEL_ID,
   DISCORD_ONBOARD_CHANNEL_ID,
+  DISCORD_WINS_CHANNEL_ID,
   DISCORD_OWNER_ID,
   DISCORD_ALLOWED_USERS,
+  WHOP_API_KEY,
 } = process.env;
+
+// Wins channel — defaults to the Pinnacle wins channel if not overridden
+const WINS_CHANNEL_ID = DISCORD_WINS_CHANNEL_ID || '1453552314953764881';
 
 // Back-compat: fall back to legacy DISCORD_CHANNEL_ID for either role if specific one isn't set
 const LEADS_CHANNEL_ID   = DISCORD_LEADS_CHANNEL_ID   || DISCORD_CHANNEL_ID;
@@ -535,6 +541,58 @@ const DRY_TEST_SLUG = 'dry-test';
 
 // ─── Onboard Pipeline ────────────────────────────────────────────────────────
 
+/**
+ * Save image attachments from a Discord message into a client's assets dir.
+ * Naming rules:
+ *   - filename contains "logo" → saved as logo.{ext}
+ *   - first non-logo image → selfie-1.{ext}
+ *   - second non-logo image → selfie-2.{ext}
+ *   - additional non-logo images are ignored
+ * Skips non-image attachments. Returns array of saved filenames.
+ */
+async function saveOnboardAttachments(attachments, assetsDir) {
+  const saved = [];
+  let selfieIdx = 0;
+  for (const att of attachments.values()) {
+    const isImage = (att.contentType && att.contentType.startsWith('image/'))
+      || /\.(jpg|jpeg|png|webp)$/i.test(att.name || '');
+    if (!isImage) continue;
+    const rawExt = (path.extname(att.name || '').slice(1).toLowerCase()) || 'jpg';
+    const ext = rawExt === 'jpeg' ? 'jpg' : rawExt;
+    let targetName;
+    if (/logo/i.test(att.name || '')) {
+      targetName = `logo.${ext}`;
+    } else if (selfieIdx < 2) {
+      selfieIdx++;
+      targetName = `selfie-${selfieIdx}.${ext}`;
+    } else {
+      continue; // ignore extras
+    }
+    try {
+      const resp = await fetch(att.url);
+      if (!resp.ok) {
+        console.error(`Attachment fetch ${att.name} → HTTP ${resp.status}`);
+        continue;
+      }
+      const buf = Buffer.from(await resp.arrayBuffer());
+      fs.writeFileSync(path.join(assetsDir, targetName), buf);
+      saved.push(targetName);
+    } catch (err) {
+      console.error(`Failed saving attachment ${att.name}:`, err.message);
+    }
+  }
+  // If we saved selfie-1 but no plain `selfie.{ext}`, alias selfie-1 →
+  // selfie.{ext} so Phase 9 (which still reads selfie.{ext}) finds it.
+  const exts = ['jpg', 'jpeg', 'png', 'webp'];
+  const hasPlainSelfie = exts.some(e => fs.existsSync(path.join(assetsDir, `selfie.${e}`)));
+  const selfie1 = exts.map(e => path.join(assetsDir, `selfie-1.${e}`)).find(p => fs.existsSync(p));
+  if (!hasPlainSelfie && selfie1) {
+    const ext = path.extname(selfie1);
+    fs.copyFileSync(selfie1, path.join(assetsDir, `selfie${ext}`));
+  }
+  return saved;
+}
+
 async function runOnboardPipeline(message, clientSlug) {
   const { runFullPipeline } = require('./service-delivery/orchestrator');
 
@@ -860,8 +918,21 @@ async function handleOnboardChannel(message, userId) {
     const assetsDir = path.join(__dirname, `../data/clients/${clientSlug}/assets`);
     fs.mkdirSync(assetsDir, { recursive: true });
 
-    // Check for required assets
-    const hasSelfie = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(assetsDir, `selfie.${ext}`)));
+    // If the onboard message has image attachments, save them straight to
+    // the assets folder. Naming: anything with "logo" in the filename →
+    // logo.{ext}; first non-logo image → selfie-1.{ext}; second → selfie-2.
+    if (message.attachments && message.attachments.size > 0) {
+      const saved = await saveOnboardAttachments(message.attachments, assetsDir);
+      if (saved.length > 0) {
+        await message.reply(`📎 Saved ${saved.length} attachment(s): ${saved.join(', ')}`);
+      }
+    }
+
+    // Check for required assets (after potential attachment-save above)
+    const hasSelfie = ['jpg', 'jpeg', 'png', 'webp'].some(ext =>
+      fs.existsSync(path.join(assetsDir, `selfie.${ext}`)) ||
+      fs.existsSync(path.join(assetsDir, `selfie-1.${ext}`))
+    );
     const hasLogo = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(assetsDir, `logo.${ext}`)));
 
     if (!hasSelfie || !hasLogo) {
@@ -869,7 +940,7 @@ async function handleOnboardChannel(message, userId) {
       pendingOnboards.set(userId, { clientSlug, expiresAt: Date.now() + 30 * 60 * 1000 });
       await message.reply(
         `Folder created: \`data/clients/${clientSlug}/assets/\`\n\n` +
-        `Missing: **${missing.join(', ')}** — upload ${missing.map(m => `\`${m}.png\``).join(' and ')} to that folder, then type \`continue\`.`
+        `Missing: **${missing.join(', ')}** — drop ${missing.map(m => `\`${m}.png\``).join(' and ')} as attachments here (or upload to the folder), then type \`continue\`.`
       );
       return true;
     }
@@ -879,6 +950,71 @@ async function handleOnboardChannel(message, userId) {
   }
 
   return false;
+}
+
+// ─── Wins channel: bread rhymes ────────────────────────────────────────────────
+//
+// Picks a random rhyme but never the same one twice in a row.
+const BREAD_RHYMES = [
+  "Yeast meets flour, hour by hour — bread on the rise, that's real power.",
+  "Knead it, prove it, watch it climb — stacking loaves one at a time.",
+  "Crust gold, crumb tight — Dilan baking through the night.",
+  "Oven hot, dough's prepped — every notification one more step.",
+  "Slice it thick, slice it thin — every transaction's a fresh win.",
+  "Flour to dollar, dollar to crust — in this bakery we trust.",
+  "Loaf by loaf the empire grows — that's just how the bread flows.",
+  "Sourdough money, wild and free — fermenting in the treasury.",
+  "Bake 'em, sell 'em, stack 'em high — bread don't sleep, neither do I.",
+  "Toast that money, butter that flow — watch the warm green dough grow.",
+  "Whisk it, mix it, watch it rise — bread money, no surprise.",
+  "Crusty edge and fluffy heart — money making's a sacred art.",
+  "Bread on bread on bread on bread — dough is multiplying instead.",
+  "Sourdough starter never sleeps — neither does the bag he keeps.",
+  "Bagel, baguette, sourdough boule — every cent's a baking tool.",
+  "Carbs is currency 'round here — another loaf, another cheer.",
+  "Flour, water, salt and yeast — bread god's blessing this big feast.",
+  "Naan, focaccia, ciabatta — money's how we like to chatter.",
+  "Gluten gains, monetary gains — same energy, different lanes.",
+  "Cinnamon roll, hundred-dollar — call me Dilan dough-money baller.",
+  "Bake and stack, bake and stack — bread's the only way back.",
+  "Fresh from the oven, hot off the press — Whop just delivered, more or less.",
+  "Pumpernickel paper, sourdough stacks — Dilan baking up the racks.",
+  "Got the dough, got the bread, got the loaf — empire rising from the stove.",
+  "Rolls in the oven, dough on the way — making more bread every single day.",
+  "Pretzel knots and croissant flakes — every payment's another break.",
+  "Brioche butter, ciabatta crunch — Pinnacle eating bread for lunch.",
+  "Rye on rye on rye on rye — watch the bread reach for the sky.",
+  "Bread machine beep, deposit ping — that's the sound of everything.",
+  "Loaf goals stacked, dough goals fed — Pinnacle bakery in the green.",
+];
+
+let lastRhymeIndex = -1;
+function pickRhyme() {
+  if (BREAD_RHYMES.length <= 1) return BREAD_RHYMES[0];
+  let i;
+  do {
+    i = Math.floor(Math.random() * BREAD_RHYMES.length);
+  } while (i === lastRhymeIndex);
+  lastRhymeIndex = i;
+  return BREAD_RHYMES[i];
+}
+
+const WIN_EMOJI_SETS = [
+  ['🍞', '💸'], ['💰', '🥖'], ['🤑', '🥯'], ['📈', '🍞'],
+  ['💵', '🥐'], ['🔥', '🍞'], ['🥖', '💸'], ['🧈', '💰'],
+];
+function pickEmojiSet() {
+  return WIN_EMOJI_SETS[Math.floor(Math.random() * WIN_EMOJI_SETS.length)];
+}
+
+function formatWinMessage(amount) {
+  const [a, b] = pickEmojiSet();
+  // amount is whatever Whop returned — usually USD, two decimals
+  const formatted = amount.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return `${a}${b} **NEW WIN: $${formatted}** ${b}${a}\n_${pickRhyme()}_`;
 }
 
 client.once('clientReady', async () => {
@@ -892,6 +1028,38 @@ client.once('clientReady', async () => {
       await channel.send('Lead Uploader Bot is online.');
     } catch (err) {
       console.error(`Could not send startup message to channel ${id}:`, err.message);
+    }
+  }
+
+  // ─── Whop → wins channel watcher ────────────────────────────────────────────
+  if (!WHOP_API_KEY) {
+    console.warn('[whop-watcher] WHOP_API_KEY not set — skipping wins channel notifications');
+  } else if (!WINS_CHANNEL_ID) {
+    console.warn('[whop-watcher] WINS_CHANNEL_ID not set — skipping wins channel notifications');
+  } else {
+    const statePath = path.join(__dirname, '../data/whop/seen-payments.json');
+    let winsChannel;
+    try {
+      winsChannel = await client.channels.fetch(WINS_CHANNEL_ID);
+    } catch (err) {
+      console.error(`[whop-watcher] could not fetch wins channel ${WINS_CHANNEL_ID}: ${err.message}`);
+    }
+    if (winsChannel) {
+      startWhopWatcher({
+        apiKey: WHOP_API_KEY,
+        statePath,
+        intervalMs: 60_000,
+        onNewPayment: async (p) => {
+          const amount = paymentAmount(p);
+          await winsChannel.send(formatWinMessage(amount));
+          console.log(`[whop-watcher] announced payment ${p.id} ($${amount})`);
+        },
+        log: (lvl, msg) => {
+          if (lvl === 'error') console.error(`[whop-watcher] ${msg}`);
+          else console.log(`[whop-watcher] ${msg}`);
+        },
+      });
+      console.log(`[whop-watcher] started — polling every 60s, posting to ${WINS_CHANNEL_ID}`);
     }
   }
 });
