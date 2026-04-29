@@ -527,16 +527,15 @@ async function runUpload(message, params) {
 
 // ─── Dry-test config ─────────────────────────────────────────────────────────
 
-// Hardcoded GHL sub-account used for `onboard <source> dry test` runs.
-// The user must add a private-integration token for this locationId to
-// data/sub-account-tokens.json before typing `continue`, otherwise Phase 4
-// (custom values) will fail.
+// Hardcoded GHL sub-account used for `onboard <source> dry test` runs. Phase 2
+// creates a private-integration token for it during the run, so no manual
+// token setup is needed.
 const DRY_TEST_LOCATION_ID = 'PqU9qEIKN9ov4Nx8dsx6';
 const DRY_TEST_SLUG = 'dry-test';
 
 // ─── Onboard Pipeline ────────────────────────────────────────────────────────
 
-async function runOnboardPipeline(message, clientSlug, options = {}) {
+async function runOnboardPipeline(message, clientSlug) {
   const { runFullPipeline } = require('./service-delivery/orchestrator');
 
   const userId = message.author.id;
@@ -549,7 +548,6 @@ async function runOnboardPipeline(message, clientSlug, options = {}) {
     await runFullPipeline(clientSlug, {
       notify: msg => message.channel.send(msg),
       waitForContinue,
-      dryTest: options.dryTest === true,
     });
   } catch (err) {
     await message.channel.send(`❌ Pipeline failed at: ${err.message}`);
@@ -759,7 +757,7 @@ async function handleOnboardChannel(message, userId) {
       return true;
     }
     pendingOnboards.delete(userId);
-    await runOnboardPipeline(message, pending.clientSlug, { dryTest: pending.dryTest });
+    await runOnboardPipeline(message, pending.clientSlug);
     return true;
   }
 
@@ -767,10 +765,11 @@ async function handleOnboardChannel(message, userId) {
   // Format: `onboard <source> dry test`
   // Clones onboarding.json + meta-config.json from <source> client into
   // `data/clients/dry-test/`, overrides location_id to DRY_TEST_LOCATION_ID,
-  // and runs the pipeline in dry-test mode (skips Phase 1/2/10, suffixes
-  // Phase 11 campaign with " — Dry Test"). Lets us reuse a real client's data
-  // + Meta ad account to test pipeline changes without touching their
-  // production sub-account or campaigns.
+  // and runs the full pipeline against the cloned data. Phase 1's idempotency
+  // guard short-circuits the email parse since the cloned data is already
+  // populated; Phases 2-11 run normally (Phase 2 creates a fresh PIT for the
+  // new sub-account). Phase 11 creates a 2nd campaign in the source client's
+  // Meta ad account alongside the existing one (Meta allows duplicate names).
   const dryTestMatch = message.content.trim().match(/^onboard\s+(.+?)\s+dry\s+test$/i);
   if (dryTestMatch) {
     const sourceQuery = dryTestMatch[1].trim().toLowerCase();
@@ -816,14 +815,14 @@ async function handleOnboardChannel(message, userId) {
     const hasSelfie = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(targetAssets, `selfie.${ext}`)));
     const hasLogo = ['jpg', 'jpeg', 'png', 'webp'].some(ext => fs.existsSync(path.join(targetAssets, `logo.${ext}`)));
 
-    pendingOnboards.set(userId, { clientSlug: DRY_TEST_SLUG, dryTest: true, expiresAt: Date.now() + 30 * 60 * 1000 });
+    pendingOnboards.set(userId, { clientSlug: DRY_TEST_SLUG, expiresAt: Date.now() + 30 * 60 * 1000 });
 
     let reply =
       `🧪 Dry test cloned from \`${sourceSlug}\`\n` +
       `Folder: \`data/clients/${DRY_TEST_SLUG}/assets/\`\n` +
-      `Sub-account: \`${DRY_TEST_LOCATION_ID}\` (must have a token in \`data/sub-account-tokens.json\` before \`continue\`)\n` +
-      `Meta: same ad account / pixel as \`${sourceSlug}\`; campaign suffixed " — Dry Test"\n` +
-      `Skipping: Phase 1 (email), Phase 2 (A2P/Twilio), Phase 10 (engagement)\n\n`;
+      `Sub-account: \`${DRY_TEST_LOCATION_ID}\` (Phase 2 will create the PIT during the run)\n` +
+      `Meta: same ad account / pixel as \`${sourceSlug}\` — campaigns will be added alongside the existing ones\n` +
+      `All 11 phases run normally against the cloned data.\n\n`;
     if (!hasSelfie || !hasLogo) {
       const missing = [!hasSelfie && 'selfie', !hasLogo && 'logo'].filter(Boolean);
       reply += `Missing: **${missing.join(', ')}** — upload ${missing.map(m => `\`${m}.png\``).join(' and ')} to that folder, then type \`continue\`.`;
