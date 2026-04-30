@@ -581,14 +581,20 @@ async function saveOnboardAttachments(attachments, assetsDir) {
       console.error(`Failed saving attachment ${att.name}:`, err.message);
     }
   }
-  // If we saved selfie-1 but no plain `selfie.{ext}`, alias selfie-1 →
-  // selfie.{ext} so Phase 9 (which still reads selfie.{ext}) finds it.
+  // Always (re)alias selfie-1 → selfie.{matching-ext} so Phase 9 (which reads
+  // selfie.{ext}) gets the freshly-uploaded file. Clear stale selfie.* of
+  // OTHER extensions to prevent old aliases from blocking the new run.
   const exts = ['jpg', 'jpeg', 'png', 'webp'];
-  const hasPlainSelfie = exts.some(e => fs.existsSync(path.join(assetsDir, `selfie.${e}`)));
   const selfie1 = exts.map(e => path.join(assetsDir, `selfie-1.${e}`)).find(p => fs.existsSync(p));
-  if (!hasPlainSelfie && selfie1) {
-    const ext = path.extname(selfie1);
-    fs.copyFileSync(selfie1, path.join(assetsDir, `selfie${ext}`));
+  if (selfie1) {
+    const srcExt = path.extname(selfie1);
+    for (const ext of exts) {
+      const stale = path.join(assetsDir, `selfie.${ext}`);
+      if (fs.existsSync(stale) && stale !== path.join(assetsDir, `selfie${srcExt}`)) {
+        fs.unlinkSync(stale);
+      }
+    }
+    fs.copyFileSync(selfie1, path.join(assetsDir, `selfie${srcExt}`));
   }
   return saved;
 }
