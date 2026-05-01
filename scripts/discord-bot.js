@@ -24,12 +24,14 @@ const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
 const { startWhopWatcher, paymentAmount } = require('./lib/whop-watcher');
+const dryTest = require('./lib/dry-test-handler');
 
 const {
   DISCORD_BOT_TOKEN,
   DISCORD_CHANNEL_ID,            // legacy single-channel var
   DISCORD_LEADS_CHANNEL_ID,
   DISCORD_ONBOARD_CHANNEL_ID,
+  DISCORD_DRY_TEST_CHANNEL_ID,
   DISCORD_WINS_CHANNEL_ID,
   DISCORD_OWNER_ID,
   DISCORD_ALLOWED_USERS,
@@ -43,9 +45,23 @@ const WINS_CHANNEL_ID = DISCORD_WINS_CHANNEL_ID || '1453552314953764881';
 const LEADS_CHANNEL_ID   = DISCORD_LEADS_CHANNEL_ID   || DISCORD_CHANNEL_ID;
 const ONBOARD_CHANNEL_ID = DISCORD_ONBOARD_CHANNEL_ID || DISCORD_CHANNEL_ID;
 
-if (!DISCORD_BOT_TOKEN || !DISCORD_OWNER_ID || (!LEADS_CHANNEL_ID && !ONBOARD_CHANNEL_ID)) {
-  console.error('Missing required env vars: DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and at least one of DISCORD_LEADS_CHANNEL_ID / DISCORD_ONBOARD_CHANNEL_ID');
+const DRY_TEST_ONLY = process.env.DRY_TEST_ONLY === 'true';
+const DRY_TEST_CHANNEL_ID = DISCORD_DRY_TEST_CHANNEL_ID || '';
+
+if (!DISCORD_BOT_TOKEN || !DISCORD_OWNER_ID) {
+  console.error('Missing required env vars: DISCORD_BOT_TOKEN, DISCORD_OWNER_ID');
   process.exit(1);
+}
+if (DRY_TEST_ONLY) {
+  if (!DRY_TEST_CHANNEL_ID) {
+    console.error('DRY_TEST_ONLY=true but DISCORD_DRY_TEST_CHANNEL_ID is not set');
+    process.exit(1);
+  }
+} else {
+  if (!LEADS_CHANNEL_ID && !ONBOARD_CHANNEL_ID) {
+    console.error('Missing required env vars: at least one of DISCORD_LEADS_CHANNEL_ID / DISCORD_ONBOARD_CHANNEL_ID');
+    process.exit(1);
+  }
 }
 
 // Build the allowed user set: always includes owner, plus any extras from DISCORD_ALLOWED_USERS
@@ -636,11 +652,20 @@ client.on('messageCreate', async (message) => {
   if (!ALLOWED_USER_IDS.has(message.author.id)) return;
 
   const channelId = message.channel.id;
+  const userId = message.author.id;
+
+  // Dry-test mode: laptop bot only handles the dedicated #dry-test channel.
+  // VPS bot has DRY_TEST_ONLY unset → falls through to the existing
+  // prod channel routing untouched.
+  if (DRY_TEST_ONLY) {
+    if (channelId !== DRY_TEST_CHANNEL_ID) return;
+    await handleDryTestChannel(message, userId);
+    return;
+  }
+
   const isLeadsChannel   = channelId === LEADS_CHANNEL_ID;
   const isOnboardChannel = channelId === ONBOARD_CHANNEL_ID;
   if (!isLeadsChannel && !isOnboardChannel) return;
-
-  const userId = message.author.id;
 
   // ─── Onboard channel: only handle onboard commands ──────────────────────────
   // (If LEADS_CHANNEL_ID === ONBOARD_CHANNEL_ID via legacy fallback, we fall
@@ -742,6 +767,90 @@ client.on('messageCreate', async (message) => {
   // All clear — run the upload
   await runUpload(message, params).catch(console.error);
 });
+
+/**
+ * Handle messages in the #dry-test channel (laptop bot only, DRY_TEST_ONLY=true).
+ * Supports three commands:
+ *   - `onboard dry test pinnacle <location_id>` — set up a fresh dry-test profile
+ *   - `reset dry test`                          — wipe data/clients/dry-test/
+ *   - `continue`                                — resolve a pending pause-point or pending onboard
+ */
+async function handleDryTestChannel(message, userId) {
+  const content = message.content.trim();
+  const dataDir = path.join(__dirname, '../data');
+
+  // reset dry test
+  if (/^reset\s+dry\s+test$/i.test(content)) {
+    const result = dryTest.resetDryTest({ slug: 'dry-test', dataDir });
+    pendingOnboards.delete(userId);
+    pendingContinues.delete(userId);
+    if (!result.wiped) {
+      await message.reply('nothing to reset');
+    } else {
+      await message.reply(
+        '🧹 wiped data/clients/dry-test/ — ready for fresh `onboard dry test pinnacle <id>`'
+      );
+    }
+    return;
+  }
+
+  // continue (resolve a pause-point inside the running pipeline)
+  if (/^continue$/i.test(content) && pendingContinues.has(userId)) {
+    const resolve = pendingContinues.get(userId);
+    pendingContinues.delete(userId);
+    resolve();
+    return;
+  }
+
+  // continue (resolve a pending dry-test onboard waiting for confirmation)
+  if (/^continue$/i.test(content) && pendingOnboards.has(userId)) {
+    const pending = pendingOnboards.get(userId);
+    if (pending.expiresAt < Date.now()) {
+      pendingOnboards.delete(userId);
+      await message.reply('Onboard session expired. Run `onboard dry test pinnacle <id>` again.');
+      return;
+    }
+    pendingOnboards.delete(userId);
+    await runOnboardPipeline(message, pending.clientSlug);
+    return;
+  }
+
+  // onboard dry test pinnacle <location_id>
+  const parsed = dryTest.parseDryTestTrigger(content);
+  if (parsed.ok) {
+    const slug = 'dry-test';
+    const { assetsDir } = dryTest.prepareDryTestProfile({
+      slug, location_id: parsed.location_id, dataDir,
+    });
+
+    let savedFiles = [];
+    if (message.attachments && message.attachments.size > 0) {
+      savedFiles = await saveOnboardAttachments(message.attachments, assetsDir);
+    }
+
+    pendingOnboards.set(userId, {
+      clientSlug: slug,
+      expiresAt: Date.now() + 30 * 60 * 1000,
+    });
+
+    await message.reply(
+      `🧪 Dry test ready\n` +
+      `Location: \`${parsed.location_id}\`\n` +
+      `Folder: \`data/clients/dry-test/\`\n` +
+      `Attachments saved: ${savedFiles.length ? savedFiles.join(', ') : '(none — drop selfies + logo, then run again)'}\n\n` +
+      `Type \`continue\` to run all 11 phases.`
+    );
+    return;
+  }
+
+  // Trigger looked like dry-test but parse failed — give a helpful error
+  if (/^onboard\s+dry\s+test/i.test(content)) {
+    await message.reply(
+      '⚠️ Dry test needs a location_id: `onboard dry test pinnacle <location_id>`\n' +
+      'Where `<location_id>` is the GHL sub-account ID (alphanumeric, hyphens or underscores only).'
+    );
+  }
+}
 
 /**
  * Handle messages in the onboard channel. Returns true if the message was
