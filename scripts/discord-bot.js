@@ -24,6 +24,7 @@ const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
 const { startWhopWatcher, paymentAmount } = require('./lib/whop-watcher');
+const { formatWinMessage } = require('./lib/win-message');
 const dryTest = require('./lib/dry-test-handler');
 
 const {
@@ -1080,71 +1081,6 @@ async function handleOnboardChannel(message, userId) {
   }
 
   return false;
-}
-
-// ─── Wins channel: bread rhymes ────────────────────────────────────────────────
-//
-// Picks a random rhyme but never the same one twice in a row.
-const BREAD_RHYMES = [
-  "Yeast meets flour, hour by hour — bread on the rise, that's real power.",
-  "Knead it, prove it, watch it climb — stacking loaves one at a time.",
-  "Crust gold, crumb tight — Dilan baking through the night.",
-  "Oven hot, dough's prepped — every notification one more step.",
-  "Slice it thick, slice it thin — every transaction's a fresh win.",
-  "Flour to dollar, dollar to crust — in this bakery we trust.",
-  "Loaf by loaf the empire grows — that's just how the bread flows.",
-  "Sourdough money, wild and free — fermenting in the treasury.",
-  "Bake 'em, sell 'em, stack 'em high — bread don't sleep, neither do I.",
-  "Toast that money, butter that flow — watch the warm green dough grow.",
-  "Whisk it, mix it, watch it rise — bread money, no surprise.",
-  "Crusty edge and fluffy heart — money making's a sacred art.",
-  "Bread on bread on bread on bread — dough is multiplying instead.",
-  "Sourdough starter never sleeps — neither does the bag he keeps.",
-  "Bagel, baguette, sourdough boule — every cent's a baking tool.",
-  "Carbs is currency 'round here — another loaf, another cheer.",
-  "Flour, water, salt and yeast — bread god's blessing this big feast.",
-  "Naan, focaccia, ciabatta — money's how we like to chatter.",
-  "Gluten gains, monetary gains — same energy, different lanes.",
-  "Cinnamon roll, hundred-dollar — call me Dilan dough-money baller.",
-  "Bake and stack, bake and stack — bread's the only way back.",
-  "Fresh from the oven, hot off the press — Whop just delivered, more or less.",
-  "Pumpernickel paper, sourdough stacks — Dilan baking up the racks.",
-  "Got the dough, got the bread, got the loaf — empire rising from the stove.",
-  "Rolls in the oven, dough on the way — making more bread every single day.",
-  "Pretzel knots and croissant flakes — every payment's another break.",
-  "Brioche butter, ciabatta crunch — Pinnacle eating bread for lunch.",
-  "Rye on rye on rye on rye — watch the bread reach for the sky.",
-  "Bread machine beep, deposit ping — that's the sound of everything.",
-  "Loaf goals stacked, dough goals fed — Pinnacle bakery in the green.",
-];
-
-let lastRhymeIndex = -1;
-function pickRhyme() {
-  if (BREAD_RHYMES.length <= 1) return BREAD_RHYMES[0];
-  let i;
-  do {
-    i = Math.floor(Math.random() * BREAD_RHYMES.length);
-  } while (i === lastRhymeIndex);
-  lastRhymeIndex = i;
-  return BREAD_RHYMES[i];
-}
-
-const WIN_EMOJI_SETS = [
-  ['🍞', '💸'], ['💰', '🥖'], ['🤑', '🥯'], ['📈', '🍞'],
-  ['💵', '🥐'], ['🔥', '🍞'], ['🥖', '💸'], ['🧈', '💰'],
-];
-function pickEmojiSet() {
-  return WIN_EMOJI_SETS[Math.floor(Math.random() * WIN_EMOJI_SETS.length)];
-}
-
-function formatWinMessage(amount) {
-  const [a, b] = pickEmojiSet();
-  // amount is whatever Whop returned — usually USD, two decimals
-  const formatted = amount.toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-  return `${a}${b} **NEW WIN: $${formatted}** ${b}${a}\n_${pickRhyme()}_`;
 }
 
 client.once('clientReady', async () => {
