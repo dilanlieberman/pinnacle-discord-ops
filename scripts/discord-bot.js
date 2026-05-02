@@ -1025,6 +1025,21 @@ async function handleOnboardChannel(message, userId) {
     return true;
   }
 
+  // ─── Defense: refuse `onboard dry test ...` in non-dry-test mode ──────────────
+  // The dedicated dry-test bot (DRY_TEST_ONLY=true) is the only path that
+  // should accept these commands. If a production bot sees one (e.g. someone
+  // added the dry-test channel ID to DISCORD_ONBOARD_CHANNEL_ID by mistake),
+  // reply with a clear error instead of letting the greedy ^onboard\s+(.+)$
+  // regex below treat "dry test pinnacle <id>" as a client slug.
+  if (/^onboard\s+dry\s+test\b/i.test(message.content.trim())) {
+    await message.reply(
+      '⚠️ This bot is not in dry-test mode (`DRY_TEST_ONLY` is not set). ' +
+      'Dry-test runs go to a dedicated laptop bot listening on the dry-test ' +
+      'channel. Nothing has been written.'
+    );
+    return true;
+  }
+
   // ─── Onboard Command ──────────────────────────────────────────────────────────
   const onboardMatch = message.content.trim().match(/^onboard\s+(.+)$/i);
   if (onboardMatch) {
