@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 
 // Hardcoded dry-test Meta entities — operator's dedicated test ad account/page.
-const DRY_TEST_AD_ACCOUNT = 'act_1515488713479185';
+const DRY_TEST_AD_ACCOUNT = 'act_760901353271871';
 const DRY_TEST_PAGE_ID = '834264503095493';
 const DRY_TEST_PHONE = '+15555550100';
 const DRY_TEST_DOMAIN = 'https://detail.direct/contact';
@@ -39,23 +39,29 @@ function prepareDryTestProfile({ slug, location_id, dataDir }) {
   const assetsDir = path.join(clientDir, 'assets');
   fs.mkdirSync(assetsDir, { recursive: true });
 
-  // onboarding.json — hardcoded dry-test overrides + blank email-parseable
-  // fields. Phase 1's email parser fills the blanks from the operator's
-  // pre-sent "dry test roofing" emails; the hand-fixed values (Meta IDs,
-  // phone, domain, dry_test flag) survive the merge by the existing
-  // "later side wins, empty values never clobber populated ones" rule.
+  // onboarding.json — fully-populated dry-test profile. Combined with the
+  // Phase 1 idempotency softening for dry_test=true, Phase 1 short-circuits
+  // entirely (it sees all required fields already populated) and never
+  // parses emails. The dry-test client folder is fully self-contained: no
+  // dependency on Gmail message contents, no risk of bogus zip codes or a
+  // stale ad-account ID overwriting our profile on re-runs.
+  //
+  // ZIPs are 7 real Westchester County NY zips clustered around Tarrytown
+  // — all have valid Census ZCTA polygons (so the geo exclusion ring works)
+  // and Meta accepts them as valid US zip codes for ad targeting.
   const onboarding = {
     location_id,
     phone_number: DRY_TEST_PHONE,
     client_domain: DRY_TEST_DOMAIN,
     dry_test: true,
-    client_business_name: '',
-    client_full_name: '',
-    client_location: '',
-    zip_codes: [],
-    client_lead_contact_email: '',
-    client_lead_scheduling_email: '',
-    client_personal_email: '',
+    client_business_name: 'Dry Test Roofing',
+    client_full_name: 'Dry Test Operator',
+    client_first_name: 'Dry',
+    client_location: 'Tarrytown, NY',
+    zip_codes: ['10591', '10502', '10522', '10523', '10533', '10570', '10595'],
+    client_lead_contact_email: 'info@drytestroofing.com',
+    client_lead_scheduling_email: 'scheduling@drytestroofing.com',
+    client_personal_email: 'dry@drytestroofing.com',
   };
   fs.writeFileSync(
     path.join(clientDir, 'onboarding.json'),
