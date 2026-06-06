@@ -49,6 +49,10 @@ const ONBOARD_CHANNEL_ID = DISCORD_ONBOARD_CHANNEL_ID || DISCORD_CHANNEL_ID;
 const DRY_TEST_ONLY = process.env.DRY_TEST_ONLY === 'true';
 const DRY_TEST_CHANNEL_ID = DISCORD_DRY_TEST_CHANNEL_ID || '';
 
+// B-Roll Randomiser channel — inert until DISCORD_BROLL_CHANNEL_ID is set, so this
+// branch is a no-op for the lead-gen flow until a dedicated channel is configured.
+const BROLL_CHANNEL_ID = process.env.DISCORD_BROLL_CHANNEL_ID || '';
+
 if (!DISCORD_BOT_TOKEN || !DISCORD_OWNER_ID) {
   console.error('Missing required env vars: DISCORD_BOT_TOKEN, DISCORD_OWNER_ID');
   process.exit(1);
@@ -661,6 +665,20 @@ client.on('messageCreate', async (message) => {
   if (DRY_TEST_ONLY) {
     if (channelId !== DRY_TEST_CHANNEL_ID) return;
     await handleDryTestChannel(message, userId);
+    return;
+  }
+
+  // ─── B-Roll channel: "roofing ad NJ" + audio → captioned reel ───────────────
+  // Fully isolated: only fires when a b-roll channel is configured AND the message
+  // is in it. Returns early, so the lead-gen / onboard routing below is untouched.
+  if (BROLL_CHANNEL_ID && channelId === BROLL_CHANNEL_ID) {
+    try {
+      const { handleBrollRequest } = require('./broll-randomiser/discord-command');
+      await handleBrollRequest(message);
+    } catch (err) {
+      console.error('broll handler error:', err);
+      await message.reply(`B-roll generation failed: ${err.message}`).catch(() => {});
+    }
     return;
   }
 
